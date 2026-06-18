@@ -1,0 +1,5 @@
+User,ID,Nickname,@everyone,18+ verified,Copper tier,Silver tier,Lead tier,==NOT AGE VERIFIED==
+example_user,123456789,ExampleUser,@everyone,18+ verified,Copper tier,,,
+another_user,234567890,AnotherUser,@everyone,18+ verified,,Silver tier,,
+lead_user,345678901,LeadUser,@everyone,18+ verified,,,Lead tier,
+not_verified_user,456789012,NotVerified,@everyone,,Copper tier,,,==NOT AGE VERIFIED==
