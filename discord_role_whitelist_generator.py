@@ -81,7 +81,31 @@ class WhitelistGeneratorApp:
         self.load_app_settings()
 
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=10)
+        # The app can be taller than some screens once the SFTP panel is shown, so
+        # the whole interface lives inside a vertically scrollable canvas.
+        outer = ttk.Frame(self.root)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        self.scroll_canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0)
+        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
+
+        # Leave a little breathing room between the content and the scrollbar.
+        self.main_scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self.scroll_canvas.yview)
+        self.main_scrollbar.grid(row=0, column=1, sticky="ns", padx=(8, 8), pady=8)
+        self.scroll_canvas.configure(yscrollcommand=self.main_scrollbar.set)
+
+        self.scroll_content = ttk.Frame(self.scroll_canvas, padding=(10, 10, 0, 10))
+        self.scroll_window = self.scroll_canvas.create_window((0, 0), window=self.scroll_content, anchor="nw")
+
+        self.scroll_content.bind("<Configure>", self._on_scroll_content_configure)
+        self.scroll_canvas.bind("<Configure>", self._on_scroll_canvas_configure)
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_mousewheel)
+        self.root.bind_all("<Button-5>", self._on_mousewheel)
+
+        top = ttk.Frame(self.scroll_content, padding=(0, 0, 10, 8))
         top.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(top, text="CSV file:").grid(row=0, column=0, sticky="w")
@@ -95,8 +119,8 @@ class WhitelistGeneratorApp:
         ttk.Button(top, text="Save Profile", command=self.save_profile_dialog).grid(row=1, column=3, padx=3, pady=(5, 0))
         top.columnconfigure(1, weight=1)
 
-        main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        main = ttk.PanedWindow(self.scroll_content, orient=tk.HORIZONTAL)
+        main.pack(fill=tk.BOTH, expand=True, padx=(0, 10), pady=5)
 
         left = ttk.Frame(main, padding=8)
         right = ttk.Frame(main, padding=8)
@@ -106,13 +130,30 @@ class WhitelistGeneratorApp:
         self._build_profile_panel(left)
         self._build_preview_panel(right)
 
-        bottom = ttk.Frame(self.root, padding=10)
+        bottom = ttk.Frame(self.scroll_content, padding=(0, 8, 10, 0))
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
         ttk.Button(bottom, text="Generate Local Files", command=self.generate_files).pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text="Upload via SFTP", command=self.upload_sftp).pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text="Open Output Folder", command=lambda: self.open_folder(self.output_folder.get())).pack(side=tk.LEFT, padx=4)
         self.status = tk.StringVar(value="Load a CSV to begin.")
         ttk.Label(bottom, textvariable=self.status).pack(side=tk.LEFT, padx=12)
+
+    def _on_scroll_content_configure(self, _event=None):
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def _on_scroll_canvas_configure(self, event):
+        # Keep the inner frame the same width as the canvas so horizontal scaling
+        # still works, while vertical overflow uses the visible scrollbar.
+        self.scroll_canvas.itemconfigure(self.scroll_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        # Windows/macOS use MouseWheel; Linux often uses Button-4/Button-5.
+        if getattr(event, "num", None) == 4:
+            self.scroll_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.scroll_canvas.yview_scroll(1, "units")
+        else:
+            self.scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def _build_profile_panel(self, parent):
         profile_box = ttk.LabelFrame(parent, text="Profile Settings", padding=8)
@@ -277,6 +318,9 @@ class WhitelistGeneratorApp:
         saved_index = {"value": None}
 
         def save_or_update(rule: OutputRule):
+            if self.duplicate_rule_filename_exists(rule.file_name, exclude_index=saved_index["value"]):
+                self.warn_duplicate_rule_filename(rule.file_name)
+                return False
             if saved_index["value"] is None:
                 self.output_rules.append(rule)
                 saved_index["value"] = len(self.output_rules) - 1
@@ -286,6 +330,7 @@ class WhitelistGeneratorApp:
                 self.status.set(f"Updated rule: {rule.file_name}")
             self.refresh_rules()
             self.rule_tree.selection_set(str(saved_index["value"]))
+            return True
 
         def start_fresh_rule():
             # The dialog stays open after saving so users can quickly add several rules.
@@ -320,9 +365,13 @@ class WhitelistGeneratorApp:
         )
 
     def _replace_rule_from_dialog(self, index: int, rule: OutputRule):
+        if self.duplicate_rule_filename_exists(rule.file_name, exclude_index=index):
+            self.warn_duplicate_rule_filename(rule.file_name)
+            return False
         self.output_rules[index] = rule
         self.refresh_rules()
         self.status.set(f"Updated rule: {rule.file_name}")
+        return True
 
     def delete_selected_rule(self):
         selected = self.rule_tree.selection()
@@ -343,6 +392,23 @@ class WhitelistGeneratorApp:
                 ", ".join(rule.must_not_have_roles),
             ))
 
+    def duplicate_rule_filename_exists(self, file_name: str, exclude_index: int | None = None) -> bool:
+        """Return True if another output rule already uses this TXT filename."""
+        target = self.normalize_output_filename(file_name).casefold()
+        for index, rule in enumerate(self.output_rules):
+            if exclude_index is not None and index == exclude_index:
+                continue
+            if self.normalize_output_filename(rule.file_name).casefold() == target:
+                return True
+        return False
+
+    def warn_duplicate_rule_filename(self, file_name: str):
+        messagebox.showwarning(
+            "Duplicate output name",
+            f"An output rule called '{self.normalize_output_filename(file_name)}' already exists.\n\n"
+            "Each output rule needs a unique file name, otherwise one list would overwrite the other when generated.",
+        )
+
     def member_has_role(self, row: pd.Series, role: str) -> bool:
         return role in row.index and str(row[role]).strip() != ""
 
@@ -354,6 +420,10 @@ class WhitelistGeneratorApp:
         name_col = self.name_column.get()
         if name_col not in self.df.columns:
             raise ValueError(f"Name column '{name_col}' was not found in the CSV.")
+
+        normalized_rule_names = [self.normalize_output_filename(rule.file_name).casefold() for rule in self.output_rules]
+        if len(normalized_rule_names) != len(set(normalized_rule_names)):
+            raise ValueError("Two or more output rules have the same file name. Rename one of them before generating lists.")
 
         output = {}
         for rule in self.output_rules:
@@ -709,7 +779,10 @@ class RuleDialog:
             must_not_have_roles=self.values(self.must_not),
         )
         if self.on_save:
-            self.on_save(self.result)
+            saved_ok = self.on_save(self.result)
+            if saved_ok is False:
+                self.dialog_status.set("Not saved: output name is already in use.")
+                return
         self.dialog_status.set(f"Saved: {self.result.file_name}. You can keep editing, click New Rule, or Close.")
 
 
