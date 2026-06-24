@@ -2,6 +2,12 @@
 
 A configurable Python/Tkinter GUI tool for turning Discord member-list CSV exports into whitelist `.txt` files.
 
+## Screenshot
+
+![Discord Role Whitelist Generator](app%20screenshot.png)
+
+The Discord Role Whitelist Generator provides a visual interface for creating role-based whitelist rules, previewing generated output files, managing reusable profiles, and optionally uploading generated lists directly via SFTP.
+
 It is designed for VRChat world whitelists, Patreon tier lists, age verification lists, game server allowlists, websites, or any setup where Discord roles decide which names go into which output file.
 
 ## Features
@@ -214,6 +220,18 @@ examples/example_members.csv           Tiny fake CSV for testing
 .gitignore                             Keeps build files and secrets out of Git
 README.md                              This file
 ```
+
+## Support the Project
+
+This project is provided free of charge and open source.
+
+If you'd like to support continued development of VRChat tools, community projects, and future releases, consider supporting me on Patreon:
+
+➡️ **Patreon:** https://www.patreon.com/Mellish_Penthouse
+
+Every bit of support helps cover hosting costs, development time, and future project releases.
+
+Thank you for helping keep these tools available to the community.
 
 ## Notes
 
