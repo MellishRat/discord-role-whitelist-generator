@@ -3,7 +3,11 @@ import os
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass, field, asdict
+from queue import Queue, Empty
+from whitelist_rules import OutputRule, build_lists, normalize_output_filename
+from csv_loader import load_members_csv
+from profile_manager import Profile, SftpSettings, load_profile, save_profile
+from sftp_uploader import upload_lists, validate_settings, paramiko
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 import tkinter as tk
@@ -11,44 +15,8 @@ from tkinter import ttk
 
 import pandas as pd
 
-try:
-    import paramiko
-except ImportError:
-    paramiko = None
-
-
 APP_TITLE = "Discord Role Whitelist Generator"
-CONFIG_VERSION = 1
 APP_SETTINGS_FILE = Path.home() / ".discord_role_whitelist_generator_settings.json"
-INVALID_FILENAME_CHARS = '<>:"/\\|?*'
-
-
-@dataclass
-class OutputRule:
-    file_name: str
-    must_have_roles: list[str] = field(default_factory=list)
-    any_of_roles: list[str] = field(default_factory=list)
-    must_not_have_roles: list[str] = field(default_factory=list)
-
-
-@dataclass
-class SftpSettings:
-    enabled: bool = False
-    host: str = ""
-    port: int = 22
-    username: str = ""
-    remote_path: str = ""
-
-
-@dataclass
-class Profile:
-    profile_name: str = "New Profile"
-    name_column: str = "Nickname"
-    output_folder: str = "output"
-    dedupe_names: bool = True
-    sort_names: bool = True
-    outputs: list[OutputRule] = field(default_factory=list)
-    sftp: SftpSettings = field(default_factory=SftpSettings)
 
 
 class WhitelistGeneratorApp:
@@ -77,7 +45,10 @@ class WhitelistGeneratorApp:
         self.output_rules: list[OutputRule] = []
         self.generated_content: dict[str, list[str]] = {}
 
+        self._upload_events = Queue()
+        self._upload_active = False
         self._build_ui()
+        self.root.after(100, self._poll_upload_events)
         self.load_app_settings()
 
     def _build_ui(self):
@@ -254,17 +225,7 @@ class WhitelistGeneratorApp:
         except Exception:
             pass
 
-    @staticmethod
-    def normalize_output_filename(raw_name: str) -> str:
-        """Clean user input and always force a .txt file extension."""
-        name = raw_name.strip()
-        for ch in INVALID_FILENAME_CHARS:
-            name = name.replace(ch, " ")
-        name = " ".join(name.split()).strip(" .")
-        stem = Path(name).stem.strip(" .") if name else ""
-        if not stem:
-            stem = "Whitelist"
-        return f"{stem}.txt"
+    normalize_output_filename = staticmethod(normalize_output_filename)
 
     def browse_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
@@ -284,8 +245,9 @@ class WhitelistGeneratorApp:
             messagebox.showwarning("Missing CSV", "Choose a CSV file first.")
             return
         try:
-            self.df = pd.read_csv(path, dtype=str).fillna("")
+            self.df = load_members_csv(path)
         except Exception as exc:
+            self.df = None
             messagebox.showerror("CSV Error", f"Could not load CSV:\n{exc}")
             return
 
@@ -409,42 +371,9 @@ class WhitelistGeneratorApp:
             "Each output rule needs a unique file name, otherwise one list would overwrite the other when generated.",
         )
 
-    def member_has_role(self, row: pd.Series, role: str) -> bool:
-        return role in row.index and str(row[role]).strip() != ""
-
     def build_lists(self) -> dict[str, list[str]]:
-        if self.df is None:
-            raise ValueError("Load a CSV first.")
-        if not self.output_rules:
-            raise ValueError("Add at least one output rule.")
-        name_col = self.name_column.get()
-        if name_col not in self.df.columns:
-            raise ValueError(f"Name column '{name_col}' was not found in the CSV.")
-
-        normalized_rule_names = [self.normalize_output_filename(rule.file_name).casefold() for rule in self.output_rules]
-        if len(normalized_rule_names) != len(set(normalized_rule_names)):
-            raise ValueError("Two or more output rules have the same file name. Rename one of them before generating lists.")
-
-        output = {}
-        for rule in self.output_rules:
-            names = []
-            for _, row in self.df.iterrows():
-                name = str(row[name_col]).strip()
-                if not name:
-                    continue
-                if any(not self.member_has_role(row, role) for role in rule.must_have_roles):
-                    continue
-                if rule.any_of_roles and not any(self.member_has_role(row, role) for role in rule.any_of_roles):
-                    continue
-                if any(self.member_has_role(row, role) for role in rule.must_not_have_roles):
-                    continue
-                names.append(name)
-            if self.dedupe_names.get():
-                names = list(dict.fromkeys(names))
-            if self.sort_names.get():
-                names = sorted(names, key=str.casefold)
-            output[self.normalize_output_filename(rule.file_name)] = names
-        return output
+        return build_lists(self.df, self.output_rules, self.name_column.get(),
+                           self.dedupe_names.get(), self.sort_names.get())
 
     def preview_lists(self):
         try:
@@ -469,7 +398,7 @@ class WhitelistGeneratorApp:
 
     def check_duplicates(self):
         try:
-            content = self.generated_content or self.build_lists()
+            content = self.build_lists()
         except Exception as exc:
             messagebox.showerror("Duplicate Check Error", str(exc))
             return
@@ -523,47 +452,56 @@ class WhitelistGeneratorApp:
         if paramiko is None:
             messagebox.showerror("Missing dependency", "Paramiko is not installed. Run: pip install paramiko")
             return
+        if self._upload_active:
+            messagebox.showinfo("Upload in progress", "Wait for the current upload to finish.")
+            return
         try:
-            if not self.generated_content:
-                self.generated_content = self.build_lists()
+            # Snapshot every Tk variable and generate current rules on the main thread.
+            content = self.build_lists()
+            settings = SftpSettings(
+                enabled=True, host=self.sftp_host.get().strip(),
+                port=int(self.sftp_port.get()), username=self.sftp_username.get().strip(),
+                remote_path=self.sftp_remote_path.get().strip())
+            validate_settings(settings)
+            output_folder = self.output_folder.get()
         except Exception as exc:
             messagebox.showerror("Upload Error", str(exc))
             return
-
         password = simpledialog.askstring("SFTP Password", "Enter SFTP password:", show="*")
         if not password:
             return
-        threading.Thread(target=self._upload_sftp_worker, args=(password,), daemon=True).start()
+        self.generated_content = content
+        self._upload_active = True
+        self.status.set("Uploading via SFTP...")
+        threading.Thread(target=self._upload_sftp_worker,
+                         args=(settings, password, content, output_folder), daemon=True).start()
 
-    def _upload_sftp_worker(self, password: str):
+    def _upload_sftp_worker(self, settings, password, content, output_folder):
+        # Only plain Python data crosses the thread boundary; no Tk calls here.
         try:
-            host = self.sftp_host.get().strip()
-            port = int(self.sftp_port.get())
-            username = self.sftp_username.get().strip()
-            remote_path = self.sftp_remote_path.get().strip().rstrip("/")
-            if not host or not username or not remote_path:
-                raise ValueError("Host, username and remote path are required.")
-            self.status.set("Uploading via SFTP...")
-            transport = paramiko.Transport((host, port))
-            transport.connect(username=username, password=password)
-            sftp = paramiko.SFTPClient.from_transport(transport)
-            try:
-                for file_name, names in self.generated_content.items():
-                    safe_name = self.normalize_output_filename(file_name)
-                    local_tmp = Path(self.output_folder.get()) / safe_name
-                    local_tmp.parent.mkdir(parents=True, exist_ok=True)
-                    local_tmp.write_text("\n".join(names), encoding="utf-8")
-                    remote_file = f"{remote_path}/{safe_name}"
-                    sftp.put(str(local_tmp), remote_file)
-                    self.status.set(f"Uploaded {file_name}")
-            finally:
-                sftp.close()
-                transport.close()
-            messagebox.showinfo("Upload Complete", "All generated files were uploaded.")
-            self.status.set("Upload complete.")
+            upload_lists(settings, password, content, output_folder,
+                         lambda text: self._upload_events.put(("progress", text)))
+            self._upload_events.put(("complete", "All generated files were uploaded."))
         except Exception as exc:
-            messagebox.showerror("SFTP Upload Error", str(exc))
-            self.status.set("Upload failed.")
+            self._upload_events.put(("error", str(exc)))
+
+    def _poll_upload_events(self):
+        try:
+            while True:
+                kind, text = self._upload_events.get_nowait()
+                if kind == "progress":
+                    self.status.set(text)
+                else:
+                    self._upload_active = False
+                    if kind == "error":
+                        self.status.set("Upload failed.")
+                        messagebox.showerror("SFTP Upload Error", text)
+                    else:
+                        self.status.set("Upload complete.")
+                        messagebox.showinfo("Upload Complete", text)
+        except Empty:
+            pass
+        self.root.after(100, self._poll_upload_events)
 
     def current_profile(self) -> Profile:
         return Profile(
@@ -605,9 +543,7 @@ class WhitelistGeneratorApp:
         if not path:
             return
         profile = self.current_profile()
-        data = asdict(profile)
-        data["config_version"] = CONFIG_VERSION
-        Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        save_profile(path, profile)
         self.profile_path.set(path)
         self.save_app_settings()
         self.status.set(f"Saved profile: {path}")
@@ -619,18 +555,7 @@ class WhitelistGeneratorApp:
 
     def load_profile(self, path: str):
         try:
-            raw = json.loads(Path(path).read_text(encoding="utf-8"))
-            outputs = [OutputRule(**item) for item in raw.get("outputs", [])]
-            sftp = SftpSettings(**raw.get("sftp", {}))
-            profile = Profile(
-                profile_name=raw.get("profile_name", "Loaded Profile"),
-                name_column=raw.get("name_column", "Nickname"),
-                output_folder=raw.get("output_folder", "output"),
-                dedupe_names=raw.get("dedupe_names", True),
-                sort_names=raw.get("sort_names", True),
-                outputs=outputs,
-                sftp=sftp,
-            )
+            profile = load_profile(path)
             self.apply_profile(profile)
             self.profile_path.set(path)
             self.save_app_settings()
